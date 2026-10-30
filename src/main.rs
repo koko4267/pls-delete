@@ -101,20 +101,10 @@ impl SDeleteApp {
         }
     }
 
-    /// Запуск зачистки свободного места
-    fn start_cleaning(&mut self, all_drives: bool) {
-        let targets = if all_drives {
-            self.drives.clone()
-        } else {
-            if self.selected_drive.is_empty() {
-                self.status = "Ошибка: диск не выбран".to_string();
-                return;
-            }
-            vec![self.selected_drive.clone()]
-        };
-
-        if targets.is_empty() {
-            self.status = "Локальные диски не найдены".to_string();
+    /// Запуск зачистки свободного места на выбранном диске
+    fn start_cleaning(&mut self) {
+        if self.selected_drive.is_empty() {
+            self.status = "Ошибка: диск не выбран".to_string();
             return;
         }
 
@@ -127,8 +117,9 @@ impl SDeleteApp {
             }
         };
 
+        let drive = self.selected_drive.clone();
         self.is_running = true;
-        self.status = "Подготовка к зачистке...".to_string();
+        self.status = format!("Подготовка к зачистке {}...", drive);
         self.progress = 0.0;
         self.controller.reset();
 
@@ -136,122 +127,114 @@ impl SDeleteApp {
         let tx = self.tx.clone();
 
         thread::spawn(move || {
-            let total = targets.len();
-            for (idx, drive) in targets.iter().enumerate() {
-                if controller.cancelled.load(Ordering::SeqCst) {
-                    let _ = tx.send(WorkerMsg::Finished(Err("Очистка отменена".to_string())));
-                    return;
-                }
+            if controller.cancelled.load(Ordering::SeqCst) {
+                let _ = tx.send(WorkerMsg::Finished(Err("Очистка отменена".to_string())));
+                return;
+            }
 
-                let drive_info = if total > 1 {
-                    format!("Диск {} ({}/{})", drive, idx + 1, total)
-                } else {
-                    format!("Диск {}", drive)
-                };
+            let drive_info = format!("Диск {}", drive);
+            let _ = tx.send(WorkerMsg::Progress {
+                text: format!("{}: запуск...", drive_info),
+                fraction: Some(0.0),
+            });
 
-                let _ = tx.send(WorkerMsg::Progress {
-                    text: format!("{}: запуск...", drive_info),
-                    fraction: Some(0.0),
-                });
+            // Формируем команду запуска: sdelete64.exe -accepteula -nobanner -z <ДИСК>
+            let mut cmd = Command::new(&sdelete_path);
+            cmd.args(["-accepteula", "-nobanner", "-z", &drive]);
+            cmd.creation_flags(CREATE_NO_WINDOW);
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
 
-                // Формируем команду запуска: sdelete64.exe -accepteula -nobanner -z <ДИСК>
-                let mut cmd = Command::new(&sdelete_path);
-                cmd.args(["-accepteula", "-nobanner", "-z", drive]);
-                cmd.creation_flags(CREATE_NO_WINDOW);
-                cmd.stdout(Stdio::piped());
-                cmd.stderr(Stdio::piped());
-
-                let mut child = match cmd.spawn() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = tx.send(WorkerMsg::Finished(Err(format!(
-                            "Ошибка запуска процесса: {}",
-                            e
-                        ))));
-                        return;
-                    }
-                };
-
-                let stdout = child.stdout.take();
-
-                // Сохраняем дескриптор дочернего процесса для возможности отмены
-                {
-                    let mut guard = controller.child.lock().unwrap();
-                    *guard = Some(child);
-                }
-
-                // Читаем поток вывода sdelete (в формате UTF-16LE) для отслеживания прогресса
-                if let Some(mut stream) = stdout {
-                    let mut raw_buf = [0u8; 128];
-                    let mut pending_byte: Option<u8> = None;
-                    let mut u16_buf = Vec::new();
-
-                    while let Ok(n) = stream.read(&mut raw_buf) {
-                        if n == 0 || controller.cancelled.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let mut i = 0;
-                        while i < n {
-                            let b = raw_buf[i];
-                            i += 1;
-                            if let Some(prev) = pending_byte.take() {
-                                let ch = u16::from_le_bytes([prev, b]);
-                                if ch == 0x000D || ch == 0x000A {
-                                    if !u16_buf.is_empty() {
-                                        let line = String::from_utf16_lossy(&u16_buf).trim().to_string();
-                                        if !line.is_empty() {
-                                            let fraction = extract_percent(&line);
-                                            let _ = tx.send(WorkerMsg::Progress {
-                                                text: format!("{}: {}", drive_info, line),
-                                                fraction,
-                                            });
-                                        }
-                                        u16_buf.clear();
-                                    }
-                                } else {
-                                    u16_buf.push(ch);
-                                }
-                            } else {
-                                pending_byte = Some(b);
-                            }
-                        }
-                    }
-
-                    // Обработка возможного остатка строки при завершении
-                    if !u16_buf.is_empty() {
-                        let line = String::from_utf16_lossy(&u16_buf).trim().to_string();
-                        if !line.is_empty() {
-                            let fraction = extract_percent(&line);
-                            let _ = tx.send(WorkerMsg::Progress {
-                                text: format!("{}: {}", drive_info, line),
-                                fraction,
-                            });
-                        }
-                    }
-                }
-
-                // Дожидаемся завершения процесса текущего диска
-                let wait_result = {
-                    let mut guard = controller.child.lock().unwrap();
-                    if let Some(mut child) = guard.take() {
-                        child.wait()
-                    } else {
-                        Ok(std::process::ExitStatus::default())
-                    }
-                };
-
-                if controller.cancelled.load(Ordering::SeqCst) {
-                    let _ = tx.send(WorkerMsg::Finished(Err("Очистка отменена".to_string())));
-                    return;
-                }
-
-                if let Err(e) = wait_result {
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
                     let _ = tx.send(WorkerMsg::Finished(Err(format!(
-                        "Ошибка выполнения процесса: {}",
+                        "Ошибка запуска процесса: {}",
                         e
                     ))));
                     return;
                 }
+            };
+
+            let stdout = child.stdout.take();
+
+            // Сохраняем дескриптор дочернего процесса для возможности отмены
+            {
+                let mut guard = controller.child.lock().unwrap();
+                *guard = Some(child);
+            }
+
+            // Читаем поток вывода sdelete (в формате UTF-16LE) для отслеживания прогресса
+            if let Some(mut stream) = stdout {
+                let mut raw_buf = [0u8; 128];
+                let mut pending_byte: Option<u8> = None;
+                let mut u16_buf = Vec::new();
+
+                while let Ok(n) = stream.read(&mut raw_buf) {
+                    if n == 0 || controller.cancelled.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let mut i = 0;
+                    while i < n {
+                        let b = raw_buf[i];
+                        i += 1;
+                        if let Some(prev) = pending_byte.take() {
+                            let ch = u16::from_le_bytes([prev, b]);
+                            if ch == 0x000D || ch == 0x000A {
+                                if !u16_buf.is_empty() {
+                                    let line = String::from_utf16_lossy(&u16_buf).trim().to_string();
+                                    if !line.is_empty() {
+                                        let fraction = extract_percent(&line);
+                                        let _ = tx.send(WorkerMsg::Progress {
+                                            text: format!("{}: {}", drive_info, line),
+                                            fraction,
+                                        });
+                                    }
+                                    u16_buf.clear();
+                                }
+                            } else {
+                                u16_buf.push(ch);
+                            }
+                        } else {
+                            pending_byte = Some(b);
+                        }
+                    }
+                }
+
+                // Обработка возможного остатка строки при завершении
+                if !u16_buf.is_empty() {
+                    let line = String::from_utf16_lossy(&u16_buf).trim().to_string();
+                    if !line.is_empty() {
+                        let fraction = extract_percent(&line);
+                        let _ = tx.send(WorkerMsg::Progress {
+                            text: format!("{}: {}", drive_info, line),
+                            fraction,
+                        });
+                    }
+                }
+            }
+
+            // Дожидаемся завершения процесса текущего диска
+            let wait_result = {
+                let mut guard = controller.child.lock().unwrap();
+                if let Some(mut child) = guard.take() {
+                    child.wait()
+                } else {
+                    Ok(std::process::ExitStatus::default())
+                }
+            };
+
+            if controller.cancelled.load(Ordering::SeqCst) {
+                let _ = tx.send(WorkerMsg::Finished(Err("Очистка отменена".to_string())));
+                return;
+            }
+
+            if let Err(e) = wait_result {
+                let _ = tx.send(WorkerMsg::Finished(Err(format!(
+                    "Ошибка выполнения процесса: {}",
+                    e
+                ))));
+                return;
             }
 
             let _ = tx.send(WorkerMsg::Finished(Ok("Очистка успешно завершена".to_string())));
@@ -298,7 +281,7 @@ impl eframe::App for SDeleteApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space(8.0);
+                ui.add_space(12.0);
 
                 // Выпадающий список выбора диска
                 ui.add_enabled_ui(!self.is_running && !self.drives.is_empty(), |ui| {
@@ -326,27 +309,17 @@ impl eframe::App for SDeleteApp {
                     });
                 });
 
-                ui.add_space(8.0);
+                ui.add_space(14.0);
 
-                // Кнопка 1: Очистить выбранный диск
+                // Единственная кнопка: Очистить выбранный диск
                 ui.add_enabled_ui(!self.is_running && !self.selected_drive.is_empty(), |ui| {
                     let btn = egui::Button::new("Очистить выбранный диск");
-                    if ui.add_sized([240.0, 34.0], btn).clicked() {
-                        self.start_cleaning(false);
+                    if ui.add_sized([240.0, 36.0], btn).clicked() {
+                        self.start_cleaning();
                     }
                 });
 
-                ui.add_space(6.0);
-
-                // Кнопка 2: Очистить ВСЕ диски
-                ui.add_enabled_ui(!self.is_running && !self.drives.is_empty(), |ui| {
-                    let btn = egui::Button::new("Очистить ВСЕ диски");
-                    if ui.add_sized([240.0, 34.0], btn).clicked() {
-                        self.start_cleaning(true);
-                    }
-                });
-
-                ui.add_space(10.0);
+                ui.add_space(14.0);
 
                 // Статус и прогрессбар / Кнопка "Отмена"
                 if self.is_running {
@@ -358,7 +331,7 @@ impl eframe::App for SDeleteApp {
 
                     ui.add_space(6.0);
 
-                    // Прогрессбар шириной 240px (под размер кнопок)
+                    // Прогрессбар шириной 240px (под размер кнопки)
                     let progress_bar = egui::ProgressBar::new(self.progress)
                         .show_percentage()
                         .animate(self.progress == 0.0);
