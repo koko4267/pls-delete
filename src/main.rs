@@ -18,10 +18,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 /// Сообщения от фонового рабочего потока к графическому интерфейсу
 enum WorkerMsg {
-    Progress {
-        text: String,
-        fraction: Option<f32>,
-    },
+    Progress(String),
     Finished(Result<String, String>),
 }
 
@@ -53,7 +50,6 @@ struct SDeleteApp {
     drives: Vec<String>,
     selected_drive: String,
     status: String,
-    progress: f32,
     is_running: bool,
     controller: ProcessController,
     tx: Sender<WorkerMsg>,
@@ -93,7 +89,6 @@ impl SDeleteApp {
             drives,
             selected_drive,
             status: "Готов к работе".to_string(),
-            progress: 0.0,
             is_running: false,
             controller: ProcessController::default(),
             tx,
@@ -120,7 +115,6 @@ impl SDeleteApp {
         let drive = self.selected_drive.clone();
         self.is_running = true;
         self.status = format!("Подготовка к зачистке {}...", drive);
-        self.progress = 0.0;
         self.controller.reset();
 
         let controller = self.controller.clone();
@@ -133,10 +127,7 @@ impl SDeleteApp {
             }
 
             let drive_info = drive.clone();
-            let _ = tx.send(WorkerMsg::Progress {
-                text: format!("{}: запуск...", drive_info),
-                fraction: Some(0.0),
-            });
+            let _ = tx.send(WorkerMsg::Progress(format!("{}: запуск...", drive_info)));
 
             // Формируем команду запуска: sdelete64.exe -accepteula -nobanner -z <ДИСК>
             let mut cmd = Command::new(&sdelete_path);
@@ -164,7 +155,7 @@ impl SDeleteApp {
                 *guard = Some(child);
             }
 
-            // Читаем поток вывода sdelete (в формате UTF-16LE) для отслеживания прогресса
+            // Читаем поток вывода sdelete (в формате UTF-16LE) для отслеживания хода работы
             if let Some(mut stream) = stdout {
                 let mut raw_buf = [0u8; 128];
                 let mut pending_byte: Option<u8> = None;
@@ -188,11 +179,7 @@ impl SDeleteApp {
                                 if !u16_buf.is_empty() {
                                     let line = String::from_utf16_lossy(&u16_buf).trim().to_string();
                                     if !line.is_empty() {
-                                        let fraction = extract_percent(&line);
-                                        let _ = tx.send(WorkerMsg::Progress {
-                                            text: format!("{}: {}", drive_info, line),
-                                            fraction,
-                                        });
+                                        let _ = tx.send(WorkerMsg::Progress(format!("{}: {}", drive_info, line)));
                                     }
                                     u16_buf.clear();
                                 }
@@ -209,11 +196,7 @@ impl SDeleteApp {
                 if !u16_buf.is_empty() {
                     let line = String::from_utf16_lossy(&u16_buf).trim().to_string();
                     if !line.is_empty() {
-                        let fraction = extract_percent(&line);
-                        let _ = tx.send(WorkerMsg::Progress {
-                            text: format!("{}: {}", drive_info, line),
-                            fraction,
-                        });
+                        let _ = tx.send(WorkerMsg::Progress(format!("{}: {}", drive_info, line)));
                     }
                 }
             }
@@ -257,18 +240,14 @@ impl eframe::App for SDeleteApp {
         // Обработка сообщений из рабочего потока
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                WorkerMsg::Progress { text, fraction } => {
+                WorkerMsg::Progress(text) => {
                     self.status = text;
-                    if let Some(f) = fraction {
-                        self.progress = f;
-                    }
                 }
                 WorkerMsg::Finished(res) => {
                     self.is_running = false;
                     match res {
                         Ok(success) => {
                             self.status = success;
-                            self.progress = 1.0;
                         }
                         Err(err) => {
                             self.status = err;
@@ -278,14 +257,14 @@ impl eframe::App for SDeleteApp {
             }
         }
 
-        // Если зачистка активна, перерисовываем интерфейс для плавного отображения прогресса
+        // Если зачистка активна, перерисовываем интерфейс для плавного отображения статуса
         if self.is_running {
             ctx.request_repaint();
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space(12.0);
+                ui.add_space(16.0);
 
                 // Выпадающий список выбора диска
                 ui.add_enabled_ui(!self.is_running && !self.drives.is_empty(), |ui| {
@@ -313,7 +292,7 @@ impl eframe::App for SDeleteApp {
                     });
                 });
 
-                ui.add_space(14.0);
+                ui.add_space(16.0);
 
                 // Единственная кнопка: Очистить выбранный диск
                 ui.add_enabled_ui(!self.is_running && !self.selected_drive.is_empty(), |ui| {
@@ -323,12 +302,12 @@ impl eframe::App for SDeleteApp {
                     }
                 });
 
-                ui.add_space(14.0);
+                ui.add_space(18.0);
 
-                // Статус и прогрессбар
+                // Текстовый статус процесса
                 ui.label(
                     egui::RichText::new(&self.status)
-                        .size(12.0)
+                        .size(13.0)
                         .color(if self.is_running {
                             ui.visuals().text_color()
                         } else {
@@ -336,24 +315,16 @@ impl eframe::App for SDeleteApp {
                         }),
                 );
 
-                ui.add_space(6.0);
-
-                // Прогрессбар шириной 240px (постоянно виден на экране)
-                let progress_bar = egui::ProgressBar::new(self.progress)
-                    .show_percentage()
-                    .animate(self.is_running && self.progress == 0.0);
-                ui.add_sized([240.0, 20.0], progress_bar);
-
-                ui.add_space(8.0);
+                ui.add_space(18.0);
 
                 // Кнопка отмены активна только во время процесса; в режиме ожидания отступ сохраняет сетку
                 if self.is_running {
                     let cancel_btn = egui::Button::new("Отмена");
-                    if ui.add_sized([100.0, 26.0], cancel_btn).clicked() {
+                    if ui.add_sized([100.0, 28.0], cancel_btn).clicked() {
                         self.cancel();
                     }
                 } else {
-                    ui.add_space(26.0);
+                    ui.add_space(28.0);
                 }
             });
         });
@@ -363,26 +334,6 @@ impl eframe::App for SDeleteApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.cancel();
     }
-}
-
-/// Извлечение процента выполнения из строки вывода sdelete (например, "15%")
-fn extract_percent(text: &str) -> Option<f32> {
-    if let Some(pct_idx) = text.rfind('%') {
-        let prefix = &text[..pct_idx];
-        let digits: String = prefix
-            .chars()
-            .rev()
-            .filter(|c| !c.is_whitespace() && *c != '\0')
-            .take_while(|c| c.is_ascii_digit())
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        if let Ok(val) = digits.parse::<f32>() {
-            return Some((val / 100.0).clamp(0.0, 1.0));
-        }
-    }
-    None
 }
 
 /// Поиск sdelete64.exe в текущей директории, рядом с бинарником или в PATH
