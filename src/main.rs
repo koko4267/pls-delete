@@ -132,7 +132,7 @@ impl SDeleteApp {
                 return;
             }
 
-            let drive_info = format!("Диск {}", drive);
+            let drive_info = drive.clone();
             let _ = tx.send(WorkerMsg::Progress {
                 text: format!("{}: запуск...", drive_info),
                 fraction: Some(0.0),
@@ -180,7 +180,11 @@ impl SDeleteApp {
                         i += 1;
                         if let Some(prev) = pending_byte.take() {
                             let ch = u16::from_le_bytes([prev, b]);
-                            if ch == 0x000D || ch == 0x000A {
+                            // Сбрасываем строку по \r, \n или сразу по символу '%'
+                            if ch == 0x000D || ch == 0x000A || ch == 0x0025 {
+                                if ch == 0x0025 {
+                                    u16_buf.push(ch);
+                                }
                                 if !u16_buf.is_empty() {
                                     let line = String::from_utf16_lossy(&u16_buf).trim().to_string();
                                     if !line.is_empty() {
@@ -321,35 +325,35 @@ impl eframe::App for SDeleteApp {
 
                 ui.add_space(14.0);
 
-                // Статус и прогрессбар / Кнопка "Отмена"
+                // Статус и прогрессбар
+                ui.label(
+                    egui::RichText::new(&self.status)
+                        .size(12.0)
+                        .color(if self.is_running {
+                            ui.visuals().text_color()
+                        } else {
+                            ui.visuals().weak_text_color()
+                        }),
+                );
+
+                ui.add_space(6.0);
+
+                // Прогрессбар шириной 240px (постоянно виден на экране)
+                let progress_bar = egui::ProgressBar::new(self.progress)
+                    .show_percentage()
+                    .animate(self.is_running && self.progress == 0.0);
+                ui.add_sized([240.0, 20.0], progress_bar);
+
+                ui.add_space(8.0);
+
+                // Кнопка отмены активна только во время процесса; в режиме ожидания отступ сохраняет сетку
                 if self.is_running {
-                    ui.label(
-                        egui::RichText::new(&self.status)
-                            .size(12.0)
-                            .color(ui.visuals().text_color()),
-                    );
-
-                    ui.add_space(6.0);
-
-                    // Прогрессбар шириной 240px (под размер кнопки)
-                    let progress_bar = egui::ProgressBar::new(self.progress)
-                        .show_percentage()
-                        .animate(self.progress == 0.0);
-                    ui.add_sized([240.0, 18.0], progress_bar);
-
-                    ui.add_space(8.0);
-
-                    // Кнопка отмены активна только во время процесса
                     let cancel_btn = egui::Button::new("Отмена");
                     if ui.add_sized([100.0, 26.0], cancel_btn).clicked() {
                         self.cancel();
                     }
                 } else {
-                    ui.label(
-                        egui::RichText::new(&self.status)
-                            .size(12.0)
-                            .color(ui.visuals().weak_text_color()),
-                    );
+                    ui.add_space(26.0);
                 }
             });
         });
@@ -381,8 +385,17 @@ fn extract_percent(text: &str) -> Option<f32> {
     None
 }
 
-/// Поиск sdelete64.exe рядом с бинарником или в переменной окружения PATH
+/// Поиск sdelete64.exe в текущей директории, рядом с бинарником или в PATH
 fn find_sdelete() -> Option<PathBuf> {
+    // 1. Поиск в текущей рабочей директории
+    if let Ok(cwd) = std::env::current_dir() {
+        let local = cwd.join("sdelete64.exe");
+        if local.is_file() {
+            return Some(local);
+        }
+    }
+
+    // 2. Поиск рядом с запущенным бинарником
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(parent) = exe_path.parent() {
             let local = parent.join("sdelete64.exe");
@@ -392,6 +405,7 @@ fn find_sdelete() -> Option<PathBuf> {
         }
     }
 
+    // 3. Поиск в переменной окружения PATH
     if let Ok(paths) = std::env::var("PATH") {
         for dir in std::env::split_paths(&paths) {
             let candidate = dir.join("sdelete64.exe");
