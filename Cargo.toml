@@ -1,13 +1,18 @@
 [package]
-name = "sdelete-gui"
+name = "pls-delete"
 version = "0.1.0"
 edition = "2021"
+description = "A minimalist and fast native Windows GUI for secure free space wiping with Sysinternals SDelete"
+license = "MIT"
+readme = "README.md"
+keywords = ["sdelete", "sysinternals", "gui", "windows", "secure-erase"]
+categories = ["command-line-utilities", "gui"]
 
 [dependencies]
 eframe = "0.29"
+image = { version = "0.25", default-features = false, features = ["png"] }
 windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
-    "Win32_Foundation",
     "Win32_System_WindowsProgramming"
 ] }
 

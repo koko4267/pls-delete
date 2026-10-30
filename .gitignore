@@ -1,2 +1,19 @@
-/target
-Cargo.lock
+# Rust build artifacts
+/target/
+
+# Binaries and executables
+*.exe
+*.dll
+*.pdb
+sdelete*.exe
+
+# IDE and editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs and crash dumps
+*.log
+*.dmp
