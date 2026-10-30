@@ -1,0 +1,15 @@
+[package]
+name = "sdelete-gui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.29"
+windows-sys = { version = "0.59", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_System_WindowsProgramming"
+] }
+
+[build-dependencies]
+embed-manifest = "1.4"
