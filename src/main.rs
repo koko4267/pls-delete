@@ -180,31 +180,52 @@ impl SDeleteApp {
                     *guard = Some(child);
                 }
 
-                // Читаем поток вывода sdelete для отслеживания прогресса
+                // Читаем поток вывода sdelete (в формате UTF-16LE) для отслеживания прогресса
                 if let Some(mut stream) = stdout {
-                    let mut buf = [0u8; 256];
-                    let mut line_buf = Vec::new();
+                    let mut raw_buf = [0u8; 128];
+                    let mut pending_byte: Option<u8> = None;
+                    let mut u16_buf = Vec::new();
 
-                    while let Ok(n) = stream.read(&mut buf) {
+                    while let Ok(n) = stream.read(&mut raw_buf) {
                         if n == 0 || controller.cancelled.load(Ordering::SeqCst) {
                             break;
                         }
-                        for &b in &buf[..n] {
-                            if b == b'\r' || b == b'\n' {
-                                if !line_buf.is_empty() {
-                                    let line = String::from_utf8_lossy(&line_buf).trim().to_string();
-                                    if !line.is_empty() {
-                                        let fraction = extract_percent(&line);
-                                        let _ = tx.send(WorkerMsg::Progress {
-                                            text: format!("{}: {}", drive_info, line),
-                                            fraction,
-                                        });
+                        let mut i = 0;
+                        while i < n {
+                            let b = raw_buf[i];
+                            i += 1;
+                            if let Some(prev) = pending_byte.take() {
+                                let ch = u16::from_le_bytes([prev, b]);
+                                if ch == 0x000D || ch == 0x000A {
+                                    if !u16_buf.is_empty() {
+                                        let line = String::from_utf16_lossy(&u16_buf).trim().to_string();
+                                        if !line.is_empty() {
+                                            let fraction = extract_percent(&line);
+                                            let _ = tx.send(WorkerMsg::Progress {
+                                                text: format!("{}: {}", drive_info, line),
+                                                fraction,
+                                            });
+                                        }
+                                        u16_buf.clear();
                                     }
-                                    line_buf.clear();
+                                } else {
+                                    u16_buf.push(ch);
                                 }
                             } else {
-                                line_buf.push(b);
+                                pending_byte = Some(b);
                             }
+                        }
+                    }
+
+                    // Обработка возможного остатка строки при завершении
+                    if !u16_buf.is_empty() {
+                        let line = String::from_utf16_lossy(&u16_buf).trim().to_string();
+                        if !line.is_empty() {
+                            let fraction = extract_percent(&line);
+                            let _ = tx.send(WorkerMsg::Progress {
+                                text: format!("{}: {}", drive_info, line),
+                                fraction,
+                            });
                         }
                     }
                 }
@@ -374,6 +395,7 @@ fn extract_percent(text: &str) -> Option<f32> {
         let digits: String = prefix
             .chars()
             .rev()
+            .filter(|c| !c.is_whitespace() && *c != '\0')
             .take_while(|c| c.is_ascii_digit())
             .collect::<String>()
             .chars()
