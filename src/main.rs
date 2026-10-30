@@ -18,7 +18,10 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 /// Сообщения от фонового рабочего потока к графическому интерфейсу
 enum WorkerMsg {
-    Progress(String),
+    Progress {
+        text: String,
+        fraction: Option<f32>,
+    },
     Finished(Result<String, String>),
 }
 
@@ -50,6 +53,7 @@ struct SDeleteApp {
     drives: Vec<String>,
     selected_drive: String,
     status: String,
+    progress: f32,
     is_running: bool,
     controller: ProcessController,
     tx: Sender<WorkerMsg>,
@@ -89,6 +93,7 @@ impl SDeleteApp {
             drives,
             selected_drive,
             status: "Готов к работе".to_string(),
+            progress: 0.0,
             is_running: false,
             controller: ProcessController::default(),
             tx,
@@ -124,6 +129,7 @@ impl SDeleteApp {
 
         self.is_running = true;
         self.status = "Подготовка к зачистке...".to_string();
+        self.progress = 0.0;
         self.controller.reset();
 
         let controller = self.controller.clone();
@@ -143,7 +149,10 @@ impl SDeleteApp {
                     format!("Диск {}", drive)
                 };
 
-                let _ = tx.send(WorkerMsg::Progress(format!("{}: запуск...", drive_info)));
+                let _ = tx.send(WorkerMsg::Progress {
+                    text: format!("{}: запуск...", drive_info),
+                    fraction: Some(0.0),
+                });
 
                 // Формируем команду запуска: sdelete64.exe -accepteula -nobanner -z <ДИСК>
                 let mut cmd = Command::new(&sdelete_path);
@@ -185,10 +194,11 @@ impl SDeleteApp {
                                 if !line_buf.is_empty() {
                                     let line = String::from_utf8_lossy(&line_buf).trim().to_string();
                                     if !line.is_empty() {
-                                        let _ = tx.send(WorkerMsg::Progress(format!(
-                                            "{}: {}",
-                                            drive_info, line
-                                        )));
+                                        let fraction = extract_percent(&line);
+                                        let _ = tx.send(WorkerMsg::Progress {
+                                            text: format!("{}: {}", drive_info, line),
+                                            fraction,
+                                        });
                                     }
                                     line_buf.clear();
                                 }
@@ -239,20 +249,28 @@ impl eframe::App for SDeleteApp {
         // Обработка сообщений из рабочего потока
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                WorkerMsg::Progress(p) => {
-                    self.status = p;
+                WorkerMsg::Progress { text, fraction } => {
+                    self.status = text;
+                    if let Some(f) = fraction {
+                        self.progress = f;
+                    }
                 }
                 WorkerMsg::Finished(res) => {
                     self.is_running = false;
                     match res {
-                        Ok(success) => self.status = success,
-                        Err(err) => self.status = err,
+                        Ok(success) => {
+                            self.status = success;
+                            self.progress = 1.0;
+                        }
+                        Err(err) => {
+                            self.status = err;
+                        }
                     }
                 }
             }
         }
 
-        // Если зачистка активна, перерисовываем интерфейс для плавного спиннера
+        // Если зачистка активна, перерисовываем интерфейс для плавного отображения прогресса
         if self.is_running {
             ctx.request_repaint();
         }
@@ -287,7 +305,7 @@ impl eframe::App for SDeleteApp {
                     });
                 });
 
-                ui.add_space(10.0);
+                ui.add_space(8.0);
 
                 // Кнопка 1: Очистить выбранный диск
                 ui.add_enabled_ui(!self.is_running && !self.selected_drive.is_empty(), |ui| {
@@ -297,7 +315,7 @@ impl eframe::App for SDeleteApp {
                     }
                 });
 
-                ui.add_space(8.0);
+                ui.add_space(6.0);
 
                 // Кнопка 2: Очистить ВСЕ диски
                 ui.add_enabled_ui(!self.is_running && !self.drives.is_empty(), |ui| {
@@ -307,19 +325,23 @@ impl eframe::App for SDeleteApp {
                     }
                 });
 
-                ui.add_space(12.0);
+                ui.add_space(10.0);
 
-                // Статус и спиннер / Кнопка "Отмена"
+                // Статус и прогрессбар / Кнопка "Отмена"
                 if self.is_running {
-                    ui.horizontal(|ui| {
-                        ui.add_space(((ui.available_width() - 200.0) / 2.0).max(0.0));
-                        ui.spinner();
-                        ui.label(
-                            egui::RichText::new(&self.status)
-                                .size(12.0)
-                                .color(ui.visuals().text_color()),
-                        );
-                    });
+                    ui.label(
+                        egui::RichText::new(&self.status)
+                            .size(12.0)
+                            .color(ui.visuals().text_color()),
+                    );
+
+                    ui.add_space(6.0);
+
+                    // Прогрессбар шириной 240px (под размер кнопок)
+                    let progress_bar = egui::ProgressBar::new(self.progress)
+                        .show_percentage()
+                        .animate(self.progress == 0.0);
+                    ui.add_sized([240.0, 18.0], progress_bar);
 
                     ui.add_space(8.0);
 
@@ -343,6 +365,25 @@ impl eframe::App for SDeleteApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.cancel();
     }
+}
+
+/// Извлечение процента выполнения из строки вывода sdelete (например, "15%")
+fn extract_percent(text: &str) -> Option<f32> {
+    if let Some(pct_idx) = text.rfind('%') {
+        let prefix = &text[..pct_idx];
+        let digits: String = prefix
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        if let Ok(val) = digits.parse::<f32>() {
+            return Some((val / 100.0).clamp(0.0, 1.0));
+        }
+    }
+    None
 }
 
 /// Поиск sdelete64.exe рядом с бинарником или в переменной окружения PATH
