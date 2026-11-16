@@ -17,3 +17,16 @@ sdelete*.exe
 # Logs and crash dumps
 *.log
 *.dmp
+
+# Secrets and environment files
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.cert
+
+# Archives and temporary files
+*.zip
+*.tar.gz
+*.7z

@@ -4,12 +4,18 @@ use std::process::Command;
 
 fn main() {
     if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
-        // Вшиваем UAC-манифест с требованием прав администратора
-        embed_manifest(
-            new_manifest("pls-delete")
-                .requested_execution_level(ExecutionLevel::RequireAdministrator),
-        )
-        .expect("Не удалось внедрить UAC-манифест");
+        let is_release = std::env::var("PROFILE")
+            .map(|p| p == "release")
+            .unwrap_or(false);
+
+        // Вшиваем UAC-манифест с требованием прав администратора для Release-сборки
+        if is_release {
+            embed_manifest(
+                new_manifest("pls-delete")
+                    .requested_execution_level(ExecutionLevel::RequireAdministrator),
+            )
+            .expect("Не удалось внедрить UAC-манифест");
+        }
 
         // Компилируем и вшиваем иконку исполняемого файла (.exe) через windres
         let out_dir = std::env::var("OUT_DIR").unwrap();
